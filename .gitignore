@@ -4,3 +4,7 @@ __pycache__/
 # Local machine state — never committed.
 config.yaml
 .hermes-review.yml
+
+.venv/
+.pytest_cache/
+.papercuts/

@@ -443,10 +443,14 @@ def review_depth_guidance(pr: dict[str, Any], files: list[dict[str, Any]], issue
     return review_depth_mode_and_guidance(pr, files, issues)[1]
 
 
-def run(cmd: list[str], *, cwd: Path | None = None, env: dict[str, str] | None = None, timeout: int = 600, check: bool = True) -> subprocess.CompletedProcess[str]:
+def run(cmd: list[str], *, cwd: Path | None = None, env: dict[str, str] | None = None, timeout: int = 600, check: bool = True, input_text: str | None = None) -> subprocess.CompletedProcess[str]:
     log("$ " + display_cmd(cmd))
+    if input_text is not None:
+        encoded = input_text.encode("utf-8")
+        log_event("command_input", input_chars=len(input_text), input_bytes=len(encoded),
+                  sha256=hashlib.sha256(encoded).hexdigest()[:12])
     started = time.monotonic()
-    proc = subprocess.run(cmd, cwd=str(cwd) if cwd else None, env=env, text=True, capture_output=True, timeout=timeout)
+    proc = subprocess.run(cmd, cwd=str(cwd) if cwd else None, env=env, text=True, encoding="utf-8", input=input_text, capture_output=True, timeout=timeout)
     duration_ms = int((time.monotonic() - started) * 1000)
     log_event("command_completed", argv=display_cmd(cmd), cwd=str(cwd) if cwd else None, exit_code=proc.returncode, duration_ms=duration_ms)
     if check and proc.returncode != 0:
@@ -1725,8 +1729,9 @@ def preflight_engine(engine: str | None = None) -> str:
 def build_engine_command(engine: str, prompt: str, worktree: Path, model: str, timeout_minutes: int) -> list[str]:
     """Argv for the configured engine's headless one-shot review mode.
 
-    The prompt rides as the last positional/flag value so no flag parser can
-    swallow later arguments. Pure function — unit-tested per engine. Binary
+    AGY reads a single user event from stdin in stream-json mode, avoiding
+    OS argument-size limits. Other adapters keep their existing argument format.
+    Pure function — unit-tested per engine. Binary
     *existence* is enforced by preflight_engine(), not here, so argv shape is
     testable for engines that are not installed on this machine.
     """
@@ -1739,7 +1744,7 @@ def build_engine_command(engine: str, prompt: str, worktree: Path, model: str, t
         argv = [binary, "--print-timeout", f"{timeout_minutes}m0s", "--sandbox", "--add-dir", str(worktree)]
         if model:
             argv += ["--model", model]
-        argv += ["--print", prompt]
+        argv += ["--input-format", "stream-json", "--output-format", "stream-json", "--print", ""]
     elif engine == "claude":
         # Read-only tool allowlist: git inspection + file reads, nothing else.
         argv = [binary, "--print", "--output-format", "text",
@@ -1775,21 +1780,49 @@ def build_engine_command(engine: str, prompt: str, worktree: Path, model: str, t
     return argv
 
 
+def agy_events_to_text(raw: str) -> str:
+    """Use the final successful verdict, never intermediate text or a partial error."""
+    results = []
+    for line in raw.splitlines():
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except ValueError as exc:
+            raise RuntimeError("agy returned malformed stream JSON") from exc
+        if isinstance(event, dict) and event.get("event") == "result":
+            results.append(event.get("result"))
+    if len(results) != 1 or not isinstance(results[0], dict):
+        raise RuntimeError("agy stream must contain exactly one final result")
+    result = results[0]
+    if result.get("status") != "SUCCESS":
+        raise RuntimeError("agy stream failed: " + safe_error_summary(result.get("error") or result.get("status") or "missing status"))
+    response = result.get("response")
+    if not isinstance(response, str):
+        raise RuntimeError("agy final result is missing its response")
+    return response
+
+
 def run_engine_review(prompt: str, worktree: Path) -> str:
     """Run the configured engine headlessly inside the isolated worktree."""
     engine = ACTIVE_ENGINE
     model = ACTIVE_MODEL
     preflight_engine(engine)
     argv = build_engine_command(engine, prompt, worktree, model, GCFG.timeout_minutes)
+    input_text = (json.dumps({"event": "user", "message": {"role": "user", "content": prompt}},
+                             ensure_ascii=False) + "\n") if engine == "agy" else None
     proc = run(
         argv,
+        input_text=input_text,
         cwd=worktree,
         env=engine_env(engine),
         timeout=GCFG.timeout_minutes * 60 + 120,
         check=False,
     )
     raw_stdout = proc.stdout or ""
-    if engine == "opencode":
+    if engine == "agy" and proc.returncode == 0:
+        raw_stdout = agy_events_to_text(raw_stdout)
+    elif engine == "opencode":
         raw_stdout = opencode_events_to_text(raw_stdout)
     combined = clean_review_output(raw_stdout)
     log_event(
@@ -1971,6 +2004,31 @@ def pr_state(state: dict[str, Any], pr_number: int) -> dict[str, Any]:
         current = {}
         state[str(pr_number)] = current
     return current
+
+
+def review_retry_remaining(state: dict[str, Any], pr_number: int, head_sha: str, *, followup: bool = False) -> int:
+    ps = state.get(str(pr_number))
+    failure = ps.get("followup_failure" if followup else "review_failure") if isinstance(ps, dict) else None
+    if not isinstance(failure, dict) or failure.get("head_sha") != head_sha:
+        return 0
+    retry_after = failure.get("retry_after")
+    if not isinstance(retry_after, int):
+        return 0
+    return max(0, retry_after - int(time.time()))
+
+
+def record_review_failure(state: dict[str, Any], pr_number: int, head_sha: str, phase: str, *, followup: bool = False) -> None:
+    ps = pr_state(state, pr_number)
+    key = "followup_failure" if followup else "review_failure"
+    previous = ps.get(key)
+    attempts = previous.get("attempts", 0) if isinstance(previous, dict) and previous.get("head_sha") == head_sha else 0
+    attempts = attempts if isinstance(attempts, int) and attempts >= 0 else 0
+    delay = min(300 * 2 ** min(attempts, 4), 3600)
+    ps[key] = {"head_sha": head_sha, "attempts": attempts + 1,
+               "retry_after": int(time.time()) + delay, "phase": phase}
+    save_state(state)
+    log_event("review_retry_scheduled", pr=pr_number, head_sha=short_sha(head_sha),
+              delay_seconds=delay, attempts=attempts + 1, followup=followup)
 
 
 def parse_github_time(value: str | None) -> dt.datetime | None:
@@ -2493,6 +2551,9 @@ def should_process(pr: dict[str, Any], args: argparse.Namespace, state: dict[str
         return False, f"ignored stale event SHA {args.head_sha}; current PR SHA is {head_sha}"
     if not args.force and state.get(n, {}).get("last_reviewed_sha") == head_sha:
         return False, f"already reviewed {head_sha}"
+    remaining = review_retry_remaining(state, int(pr["number"]), head_sha)
+    if remaining and not args.force and not args.dry_run and not args.dump_prompt and not args.preflight_only:
+        return False, f"retry delayed for {remaining}s after a failed review of this head"
     return True, "process"
 
 
@@ -2642,6 +2703,7 @@ def process_one(token: str, pr_number: int, args: argparse.Namespace, state: dic
 
         ps = pr_state(state, pr_number)
         reviewed_at = now_iso()
+        ps.pop("review_failure", None)
         ps.update({
             "last_reviewed_sha": head_sha,
             "checkpoint_sha": head_sha,
@@ -2710,6 +2772,7 @@ def process_one(token: str, pr_number: int, args: argparse.Namespace, state: dic
         )
         if args.dry_run or args.dump_prompt:
             raise
+        record_review_failure(state, pr_number, head_sha, phase)
         visible = False
         failure_url = status_target_url
         try:
@@ -2776,6 +2839,12 @@ def process_followup(token: str, pr_number: int, args: argparse.Namespace, state
             ps_cmd = pr_state(state, pr_number)
             ps_cmd["last_command_comment_id"] = max(int(ps_cmd.get("last_command_comment_id") or 0), trigger_comment_id)
             save_state(state)
+
+        remaining = review_retry_remaining(state, pr_number, head_sha, followup=True)
+        if remaining and not (trigger_comment_id or args.force or args.dry_run or args.dump_prompt or args.preflight_only):
+            log_event("followup_review_ignored", pr=pr_number, head_sha=short_sha(head_sha),
+                      reason=f"retry delayed for {remaining}s after a failed follow-up")
+            return False
 
         if args.preflight_only:
             log_event("preflight_ok", repo=OWNER_REPO, pr=pr_number, head_sha=short_sha(head_sha), mode="followup")
@@ -2938,6 +3007,7 @@ def process_followup(token: str, pr_number: int, args: argparse.Namespace, state
             react_to_comment_best_effort(token, trigger_comment_id, "+1")
 
         reviewed_at = now_iso()
+        ps.pop("followup_failure", None)
         ps.update({
             "last_reviewed_sha": head_sha,
             "checkpoint_sha": head_sha,
@@ -3019,6 +3089,7 @@ def process_followup(token: str, pr_number: int, args: argparse.Namespace, state
         )
         if args.dry_run or args.dump_prompt:
             raise
+        record_review_failure(state, pr_number, head_sha, phase, followup=True)
         failure_url = status_target_url
         try:
             if base_sha:

@@ -23,7 +23,7 @@ Pick any engine in `config.yaml`. Same reviewer brain, different headless CLI.
 
 | Engine      | Status on this build | Notes |
 |-------------|----------------------|-------|
-| `agy`       | **proven**           | Antigravity CLI — runs the live example above. Google sign-in or `GEMINI_API_KEY`. |
+| `agy`       | **proven**           | Antigravity CLI with stream-json stdin input. Google sign-in or `GEMINI_API_KEY`. |
 | `opencode`  | **smoke-tested**     | Headless invocation verified at build time. |
 | `hermes`    | **smoke-tested**     | Uses your existing Hermes providers — zero extra subscriptions. |
 | `claude`    | experimental         | CLI not on the build machine; argv unit-tested, `--allowedTools` read-only allowlist. |
@@ -275,3 +275,21 @@ adds its own namespaced files.
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+
+### Large reviews and failed retries
+
+The AGY adapter sends one JSON user event over stdin rather than putting the
+review prompt in a command-line argument. This avoids Linux's single-argument
+size limit without truncating the review. Use an AGY version supporting
+`--input-format stream-json` and `--output-format stream-json`. The bot publishes
+only a final `SUCCESS` result; partial output or an engine error cannot become
+a successful verdict. Logs retain input sizes and a digest, not prompt contents.
+
+Automatic retries for a failed head wait 5, 10, 20, 40, then 60 minutes. The delay
+stays at one hour for later failures. Initial and follow-up failures have separate
+state. A new head starts immediately, successful reviews clear their failure
+state, and `--force` or a validated manual follow-up command bypasses the delay.
+
+GitHub's Python tests workflow runs the full suite, including an actual child
+process receiving a multiline Unicode prompt larger than 128 KiB via stdin.
